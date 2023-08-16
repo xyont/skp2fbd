@@ -6,8 +6,12 @@
 require 'sketchup.rb'
 
 # Define global variables
-$counter = 1
+$pointcounter = 1
+$centercounter = 1
 $linecounter = 1
+$facecounter = 1
+$surfcounter = 1
+$bodycounter = 1
 $unique_points = []
 $unique_edges = []
 $unique_faces = []
@@ -220,7 +224,7 @@ def write_header(myFile)
 	myFile.puts "# *****************************************************/"
 	myFile.puts ""
 	myFile.puts "# Parameters :"
-	myFile.puts "valu ldiv 4"
+	myFile.puts "valu ldv 4"
 	myFile.puts ""
 end
 
@@ -231,14 +235,14 @@ def	write_points_to_fbd_file(myFile)
 	$unique_points.each{|v|
 	# Transform local position to a global position
 	pts=v.position.transform!($groups_position[i])
-	myFile.puts sprintf("pnt P0%d %.2f %.2f %.2f\n",$counter, pts[0].to_mm, pts[1].to_mm, pts[2].to_mm)
+	myFile.puts sprintf("pnt P0%d %.2f %.2f %.2f\n",$pointcounter, pts[0].to_mm, pts[1].to_mm, pts[2].to_mm)
 	i += 1
-	$counter += 1}
+	$pointcounter += 1}
 	
 	myFile.puts "\n# Center of circle(s)"
 	$circle_center.each{|c|
-	myFile.puts sprintf("pnt P0%d %.2f %.2f %.2f\n",$counter, c[0].to_mm, c[1].to_mm, c[2].to_mm)
-	$counter += 1
+	myFile.puts sprintf("pnt C0%d %.2f %.2f %.2f\n",$centercounter, c[0].to_mm, c[1].to_mm, c[2].to_mm)
+	$centercounter += 1
 	}
 	myFile.puts ""
 end
@@ -260,7 +264,7 @@ def	write_lines_to_fbd_file(myFile)
 	edge2=e.start
 	end_index = $unique_points.index(edge1)+1
 	start_index = $unique_points.index(edge2)+1
-	myFile.puts sprintf("line L0%d P0%d P0%d ldiv\n",$linecounter, start_index, end_index)
+	myFile.puts sprintf("line L0%d P0%d P0%d ldv\n",$linecounter, start_index, end_index)
 	$linecounter += 1}
 
 	myFile.puts ""
@@ -274,24 +278,24 @@ def	write_faces_to_fbd_file(myFile)
 		loop = f.loops
 		if loop.length == 1
 			# Case: Simple face with no inner faces
-			text = sprintf("seta A0%d l ",$linecounter)
+			text = sprintf("gsur A0%d + blend ",$facecounter)
 			edges=f.edges
 			edges.each{|e|
 				edge_index = $unique_edges.index(e)+1
 				if e.reversed_in? f
-					text = text + sprintf("L0%d ",edge_index)
+					text = text + sprintf("+ L0%d ",edge_index)
 				else
-					text = text + sprintf("L0%d ",edge_index)
+					text = text + sprintf("+ L0%d ",edge_index)
 				end
 				}
 			text=text[0..-2]
-			text = text + sprintf(" \n")
+			text = text + sprintf("\n")
 			myFile.puts text
-			surfacenumber = $linecounter
-			$linecounter += 1
-			face_index_number << $linecounter
-			myFile.puts sprintf("surf S0%d A0%d \n",$linecounter, surfacenumber)
-			$linecounter += 1
+			surfacenumber = $facecounter
+			$facecounter += 1
+			face_index_number << $facecounter
+			myFile.puts sprintf("seta S0%d s A0%d \n",$surfcounter, surfacenumber)
+			$surfcounter += 1
 		else
 			face_index_number << 0 # We need to store a face index for each face
 			# Case: Complex face with one or more inner faces
@@ -299,50 +303,50 @@ def	write_faces_to_fbd_file(myFile)
 			if not $outer_face.include?(f.outer_loop.face) # Check if we already processed these faces
 				$outer_face << f.outer_loop.face
 				outer_loop_of_face = f.outer_loop.edges
-				text = sprintf("seta A0%d l ",$linecounter)
+				text = sprintf("gsur A0%d + blend ",$facecounter)
 				outer_loop_of_face.each{|e|
 					edge_index = $unique_edges.index(e)+1
 					if e.reversed_in? f
-						text = text + sprintf("L0%d ",edge_index)
+						text = text + sprintf("+ L0%d ",edge_index)
 					else
-						text = text + sprintf("L0%d ",edge_index)
+						text = text + sprintf("+ L0%d ",edge_index)
 					end
 					}
 				text=text[0..-2]
-				text = text + sprintf(" \n")
+				text = text + sprintf("\n")
 				myFile.puts text
-				exterior_loop = $linecounter
-				$linecounter += 1
+				exterior_loop = $facecounter
+				$facecounter += 1
 
 				#Do all other faces
 				line_loop_number = []
 				loop.each{|b|
 					if b.face==f.outer_loop.face
 					else
-						text = sprintf("seta A0%d l ",$linecounter)
+						text = sprintf("gsur A0%d + blend ",$facecounter)
 						b.edges.each{|e|
 							edge_index = $unique_edges.index(e)+1
 							if e.reversed_in? f
-								text = text + sprintf("L0%d ",edge_index)
+								text = text + sprintf("+ L0%d ",edge_index)
 							else
-								text = text + sprintf("L0%d ",edge_index)
+								text = text + sprintf("+ L0%d ",edge_index)
 							end
 							}
 						text=text[0..-2]
-						text = text + sprintf(" \n")
+						text = text + sprintf("\n")
 						myFile.puts text
-						line_loop_number << $linecounter
-						$linecounter += 1
+						line_loop_number << $facecounter
+						$facecounter += 1
 					end
 				}
-				str = sprintf("surf S0%d  A0%d",$linecounter,exterior_loop)
+				str = sprintf("seta S0%d s A0%d",$surfcounter,exterior_loop)
 				line_loop_number.each{|n|
 				str << sprintf(" %d",n)
 				}
-				str << sprintf(" \n")
+				str << sprintf("\n")
 				myFile.puts str
-				$complex_face_index_number << $linecounter
-				$linecounter += 1
+				$complex_face_index_number << $surfcounter
+				$surfcounter += 1
 			end
 		end
 	}
@@ -354,7 +358,7 @@ def	write_volumes_to_fbd_file(myFile,face_index_number)
 	# write all groups as volumes to .fbd file
 	face_in_this_group = 0
 	$unique_groups.each{|g|
-		text = sprintf("seta V0%d s ",$linecounter)
+		text = sprintf("seta V0%d s ",$surfcounter)
 		g.entities.parent.entities.each{|face|
 		next unless face.is_a?(Sketchup::Face)
 		# We need to find at least one face in a group
@@ -362,23 +366,23 @@ def	write_volumes_to_fbd_file(myFile,face_index_number)
 		loop = face.loops
 		if loop.length == 1
 			face_number = face_index_number[$unique_faces.index(face)]
-			text = text + sprintf("S0%d ",face_number)
+			text = text + sprintf("S0%d ",face_number-1)
 		else
 			if not $outer_face2.include?(face.outer_loop.face) # Check if we already processed these faces
 				$outer_face2 << face.outer_loop.face
 				face_number = $complex_face_index_number[$outer_face.index(face.outer_loop.face)]
-				text = text + sprintf("S0%d ",face_number)
+				text = text + sprintf("S0%d ",face_number-1)
 			end
 		end
 		}
 		if face_in_this_group == 1
 		  text=text[0..-2]
-		  text = text + sprintf(" \n")
+		  text = text + sprintf("\n")
 		  myFile.puts text
-		  volumenumber = $linecounter
-		  $linecounter += 1
-		  myFile.puts sprintf("body B0%d V0%d \n",$linecounter, volumenumber)
-		  $linecounter += 1
+		  volumenumber = $surfcounter
+		  $surfcounter += 1
+		  myFile.puts sprintf("body B0%d V0%d\n",$surfcounter, volumenumber)
+		  $bodycounter += 1
 		  face_in_this_group = 0 # Set to 0 again
 		end
 	}
