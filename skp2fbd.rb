@@ -408,6 +408,8 @@ def	write_text_to_fbd_file(myFile)
 	myFile.puts ""
 	myFile.puts "prnt se"
 	myFile.puts ""
+	myFile.puts "#/neigh all 0.1 abq con tie"
+	myFile.puts ""
 	myFile.puts "#/seta Support A0x"
 	myFile.puts "#/comp Support do"
 	myFile.puts "#/send Support abq spc 123"
