@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
-"""CalculiX CGX .fbd exporter - v0.0.7.
+"""CalculiX CGX .fbd exporter - v0.0.10.
 
-v0.0.7: Semua line ditulis dengan parameter `ldv` (panjang segmen).
+v0.0.10: Sama seperti v0.0.7 (per-cid, struktur benar), tapi
+fit circle pakai 3 titik tersebar (exact) untuk center yang presisi.
 """
 from __future__ import annotations
 
@@ -16,13 +17,11 @@ from PySide6.QtWidgets import QFileDialog, QMessageBox
 from tools.base import Tool
 
 
-# Set True untuk menambahkan `ldv` di akhir setiap line
-# (termasuk busur). Set False untuk format lama.
 _USE_LDV_ON_ARC = True
 
 
 class ExportFBDTool(Tool):
-    name = "Export CalculiX FBD v0.0.7"
+    name = "Export CalculiX FBD v0.0.10"
     shortcut = None
     uses_snap = False
 
@@ -128,82 +127,85 @@ def _sub3(a, b):
     return QVector3D(a.x() - b.x(), a.y() - b.y(), a.z() - b.z())
 
 
-def _fit_circle_geometric(points):
-    """Fit circle 3D di bidang apapun."""
-    n = len(points)
-    if n < _MIN_FIT_POINTS:
-        return None
-
-    p1 = points[0]
-    p2 = max(points[1:], key=lambda p: (p - p1).length())
-    p3 = max(points, key=lambda p: min(
-        (p - p1).length(), (p - p2).length()))
-
-    normal = QVector3D.crossProduct(_sub3(p2, p1), _sub3(p3, p1))
+def _fit_circle_3pts(p1, p2, p3):
+    """Fit circle exact dari 3 titik di bidang 3D."""
+    v1 = _sub3(p2, p1)
+    v2 = _sub3(p3, p1)
+    normal = QVector3D.crossProduct(v1, v2)
     if normal.length() < 1e-9:
         return None
     normal = normal.normalized()
 
-    u = _sub3(p2, p1).normalized()
+    u = v1.normalized()
     v = QVector3D.crossProduct(normal, u)
 
-    pts_2d = []
-    for p in points:
+    def to_2d(p):
         d = _sub3(p, p1)
-        pts_2d.append((QVector3D.dotProduct(d, u),
-                       QVector3D.dotProduct(d, v)))
+        return (QVector3D.dotProduct(d, u),
+                QVector3D.dotProduct(d, v))
 
-    n_pts = len(pts_2d)
-    sx = sy = sxx = syy = sxy = 0.0
-    sxz = syz = sz = 0.0
-    for (x, y) in pts_2d:
-        z = x*x + y*y
-        sx += x
-        sy += y
-        sxx += x*x
-        syy += y*y
-        sxy += x*y
-        sxz += x*z
-        syz += y*z
-        sz += z
+    ax, ay = to_2d(p1)
+    bx, by = to_2d(p2)
+    cx, cy = to_2d(p3)
 
-    M = [
-        [4*sxx, 4*sxy, 2*sx],
-        [4*sxy, 4*syy, 2*sy],
-        [2*sx,  2*sy,  n_pts],
-    ]
-    rhs = [2*sxz, 2*syz, sz]
-
-    def det3(m):
-        return (m[0][0]*(m[1][1]*m[2][2] - m[1][2]*m[2][1])
-                - m[0][1]*(m[1][0]*m[2][2] - m[1][2]*m[2][0])
-                + m[0][2]*(m[1][0]*m[2][1] - m[1][1]*m[2][0]))
-
-    D = det3(M)
-    if abs(D) < 1e-15:
+    d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-15:
         return None
-
-    M1 = [row[:] for row in M]
-    M2 = [row[:] for row in M]
-    M3 = [row[:] for row in M]
-    for i in range(3):
-        M1[i][0] = rhs[i]
-        M2[i][1] = rhs[i]
-        M3[i][2] = rhs[i]
-
-    cx2 = det3(M1) / D
-    cy2 = det3(M2) / D
-    c = det3(M3) / D
-
-    cx = cx2 / 2.0
-    cy = cy2 / 2.0
-    r2 = c + cx*cx + cy*cy
+    ux = ((ax*ax + ay*ay) * (by - cy)
+          + (bx*bx + by*by) * (cy - ay)
+          + (cx*cx + cy*cy) * (ay - by)) / d
+    uy = ((ax*ax + ay*ay) * (cx - bx)
+          + (bx*bx + by*by) * (ax - cx)
+          + (cx*cx + cy*cy) * (bx - ax)) / d
+    r2 = (ax - ux)**2 + (ay - uy)**2
     if r2 < 1e-12:
         return None
     radius = math.sqrt(r2)
 
-    center = p1 + u * cx + v * cy
+    center = p1 + u * ux + v * uy
     return center, normal, radius
+
+
+def _fit_circle_geometric(points):
+    """Fit circle dari 3 titik tersebar (exact) â€” lebih stabil
+    daripada least-squares untuk busur parsial."""
+    n = len(points)
+    if n < 3:
+        return None
+    if n == 3:
+        return _fit_circle_3pts(points[0], points[1], points[2])
+
+    # Pilih 3 titik tersebar
+    p1 = points[0]
+    p2 = points[n // 2]
+    line_dir = _sub3(p2, p1)
+    line_len = line_dir.length()
+    if line_len < 1e-9:
+        # p1 dan p2 terlalu dekat, coba titik lain
+        for i in range(1, n):
+            p2 = points[i]
+            line_dir = _sub3(p2, p1)
+            line_len = line_dir.length()
+            if line_len > 1e-9:
+                break
+        if line_len < 1e-9:
+            return None
+
+    line_dir_n = line_dir / line_len
+    best_dist = -1.0
+    p3 = None
+    for p in points:
+        d = _sub3(p, p1)
+        proj = QVector3D.dotProduct(d, line_dir_n)
+        perp = d - line_dir_n * proj
+        dist = perp.length()
+        if dist > best_dist:
+            best_dist = dist
+            p3 = p
+    if p3 is None or best_dist < 1e-9:
+        return None
+
+    return _fit_circle_3pts(p1, p2, p3)
 
 
 def _make_angle_fn(center, normal):
@@ -296,23 +298,27 @@ def save_fbd(scene, path) -> None:
             points.append((_mm(p.x()), _mm(p.y()), _mm(p.z())))
         return pid
 
-    # -- 1. curves --
+    # -- 1. curves (per-cid seperti v0.0.7) --
     for mesh, _owner in meshes:
         curve_edges = [e for e in mesh.edges
                        if getattr(e, "curve", None) is not None]
         if not curve_edges:
             continue
-        all_pts = []
-        seen = set()
+
+        # Fit circle global (untuk center) â€” pakai 3 titik
+        all_pts_global = []
+        seen_global = set()
         for e in curve_edges:
             for v in (e.v0, e.v1):
-                if id(v) not in seen:
-                    seen.add(id(v))
-                    all_pts.append(v.position)
-        if len(all_pts) < 3:
+                if id(v) not in seen_global:
+                    seen_global.add(id(v))
+                    all_pts_global.append(v.position)
+
+        if len(all_pts_global) < 3:
             continue
-        fit = _fit_circle_geometric(all_pts)
-        if fit is None:
+
+        fit_global = _fit_circle_geometric(all_pts_global)
+        if fit_global is None:
             for e in curve_edges:
                 pa = add_point(e.v0.position)
                 pb = add_point(e.v1.position)
@@ -320,7 +326,8 @@ def save_fbd(scene, path) -> None:
                     ("line", id(e)), _make_factory_line(pa, pb, None))
                 edge_to_line[id(e)] = lid
             continue
-        center, normal, radius = fit
+
+        center, normal, radius = fit_global
         cid_pt = add_point(center)
         curve_id = curve_reg.id_of(("center", id(mesh)))
         if curve_id > len(circles):
@@ -328,6 +335,7 @@ def save_fbd(scene, path) -> None:
 
         angle_of = _make_angle_fn(center, normal)
 
+        # Proses per-cid (seperti v0.0.7)
         by_cid = defaultdict(list)
         for e in curve_edges:
             cid = getattr(e, "curve", None)
@@ -371,7 +379,6 @@ def save_fbd(scene, path) -> None:
             for k in range(n_arcs + 1):
                 idx = int(round(k * n_v / n_arcs)) % n_v
                 boundaries.append(idx)
-
             if not is_closed:
                 boundaries[-1] = n_v - 1
 
@@ -384,6 +391,7 @@ def save_fbd(scene, path) -> None:
                 v_b = verts[i_end] if i_end < n_v else verts[-1]
                 pa = add_point(v_a.position)
                 pb = add_point(v_b.position)
+                # Kunci busur per cid (seperti v0.0.7)
                 lid = line_reg.ensure(
                     ("arc", (cid, k)),
                     _make_factory_line(pa, pb, cid_pt))
@@ -530,7 +538,7 @@ def save_fbd(scene, path) -> None:
 def _write_header(f) -> None:
     f.write("# *****************************************************\n")
     f.write("# *\n")
-    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.7)\n")
+    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.10)\n")
     f.write("# *\n")
     f.write("# *****************************************************/\n\n")
     f.write("# Parameters :\n")
@@ -560,10 +568,8 @@ def _write_lines(f, lines) -> None:
         if entry[2] is not None:
             a, b, c = entry
             if _USE_LDV_ON_ARC:
-                # Format baru: busur dengan ldv
                 f.write(f"line L{i} P{a} P{b} C{c} ldv\n")
             else:
-                # Format lama: busur tanpa ldv
                 f.write(f"line L{i} P{a} P{b} C{c}\n")
         else:
             a, b = entry[0], entry[1]
