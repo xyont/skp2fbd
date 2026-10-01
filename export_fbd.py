@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
-"""CalculiX CGX .fbd exporter - v0.0.27.
+"""CalculiX CGX .fbd exporter - v0.0.28.
 
-v0.0.27: Fix radial ring penuh â€” 4 radial (bukan 5). Radial share
-antar sektor.
+v0.0.28: Fix wrap di _process_face_curves â€” busur terakhir tidak
+diproses karena boundaries[-1]=0 (wrap). Sekarang handle i_end <= i_start.
 """
 from __future__ import annotations
 
@@ -18,11 +18,11 @@ from tools.base import Tool
 
 
 _USE_LDV_ON_ARC = True
-_VERSION = "0.0.27"
+_VERSION = "0.0.28"
 
 
 class ExportFBDTool(Tool):
-    name = "Export CalculiX FBD v0.0.27"
+    name = "Export CalculiX FBD v0.0.28"
     shortcut = None
     uses_snap = False
 
@@ -338,6 +338,9 @@ def _order_curve_vertices(edges, verts):
 
 def _process_face_curves(face, mesh, point_reg, line_reg, lines,
                          curve_reg, circles, add_point, edge_to_line):
+    """Proses busur untuk 1 face.
+    v0.0.28: fix wrap â€” handle i_end <= i_start.
+    """
     loop = list(face.loop)
     n = len(loop)
     if n < 3:
@@ -439,23 +442,33 @@ def _process_face_curves(face, mesh, point_reg, line_reg, lines,
         if not is_closed:
             boundaries[-1] = n_v - 1
 
+        # v0.0.28: fix wrap
         for k in range(n_arcs):
             i_start = boundaries[k]
             i_end = boundaries[k + 1]
-            if i_start >= n_v or i_end > n_v:
+            if i_start >= n_v:
                 continue
+            # Handle wrap: kalau i_end <= i_start, berarti sampai akhir
+            if i_end <= i_start:
+                i_end = n_v
+            # Titik ujung busur
             v_a = verts[i_start]
-            v_b = verts[i_end] if i_end < n_v else verts[-1]
+            if i_end == n_v:
+                # Busur terakhir: v_b = verts[0] (kembali ke awal)
+                v_b = verts[0]
+            else:
+                v_b = verts[i_end]
             pa = add_point(v_a.position)
             pb = add_point(v_b.position)
             lid = line_reg.ensure(
                 ("arc", (id(face), cid, k)),
                 _make_factory_line(pa, pb, center_idx))
-            for i in range(i_start, min(i_end, n_v - 1)):
-                if i + 1 >= n_v:
+            # Petakan edge dalam range [i_start, i_end)
+            for i in range(i_start, i_end):
+                if i >= n_v:
                     break
                 v1 = verts[i]
-                v2 = verts[i + 1]
+                v2 = verts[(i + 1) % n_v]
                 e = mesh.find_edge(v1, v2)
                 if (e is not None
                         and getattr(e, "curve", None) is not None):
@@ -464,9 +477,7 @@ def _process_face_curves(face, mesh, point_reg, line_reg, lines,
 
 def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
                   circles, add_point, edge_to_line):
-    """Proses ring penuh via hole_loops: 4 sektor.
-    v0.0.27: 4 radial (bukan 5), share antar sektor.
-    """
+    """Proses ring penuh via hole_loops: 4 sektor."""
     outer = list(face.loop)
     holes = list(getattr(face, 'hole_loops', []) or [])
     if not holes:
@@ -568,7 +579,6 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             best_idx = i
     verts_i = verts_i[best_idx:] + verts_i[:best_idx]
 
-    # 4 sektor
     n_arcs = 4
 
     n_v_o = len(verts_o)
@@ -582,7 +592,6 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
         outer_starts.append(verts_o[idx_o])
         inner_starts.append(verts_i[idx_i])
 
-    # Busur outer (4 busur)
     for k in range(n_arcs):
         k_next = (k + 1) % n_arcs
         v_a = outer_starts[k]
@@ -605,7 +614,6 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             if e is not None and getattr(e, 'curve', None) is not None:
                 edge_to_line[id(e)] = lid
 
-    # Busur inner (4 busur)
     for k in range(n_arcs):
         k_next = (k + 1) % n_arcs
         v_a = inner_starts[k]
@@ -628,7 +636,6 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             if e is not None and getattr(e, 'curve', None) is not None:
                 edge_to_line[id(e)] = lid
 
-    # v0.0.27: 4 radial (bukan 5)
     for k in range(n_arcs):
         v_a = outer_starts[k]
         v_b = inner_starts[k]
@@ -638,7 +645,6 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             ("radial", (id(face), k)),
             _make_factory_line(pa, pb, None))
 
-    # 4 sektor quad (share radial)
     sectors = []
     for k in range(n_arcs):
         k_next = (k + 1) % n_arcs
@@ -676,7 +682,6 @@ def save_fbd(scene, path) -> dict:
             points.append((_mm(p.x()), _mm(p.y()), _mm(p.z())))
         return pid
 
-    # -- 1. straight edges (global) --
     for mesh, _owner in meshes:
         for e in mesh.edges:
             if getattr(e, "curve", None) is not None:
@@ -689,7 +694,6 @@ def save_fbd(scene, path) -> dict:
                 ("line", id(e)), _make_factory_line(pa, pb, None))
             edge_to_line[id(e)] = lid
 
-    # -- 2. surfaces --
     for mesh, owner in meshes:
         curve_adj = _build_curve_adj(mesh)
         radial_adj = _build_radial_adj(mesh)
@@ -765,7 +769,6 @@ def save_fbd(scene, path) -> dict:
             if deduped:
                 all_surfaces.append({"owner": owner, "gsurs": [deduped]})
 
-    # -- 3. volumes --
     owner_surfaces = defaultdict(list)
     for i, surf in enumerate(all_surfaces, start=1):
         if surf.get("owner") is not None:
@@ -780,7 +783,6 @@ def save_fbd(scene, path) -> dict:
         gid = group_reg.id_of(g.uid)
         volumes.append({"id": gid, "surfaces": surf_ids})
 
-    # -- 4. Remove dangling points --
     used = set()
     for entry in lines:
         used.add(entry[0])
@@ -819,7 +821,6 @@ def save_fbd(scene, path) -> dict:
     circles = new_circles
     points = new_points
 
-    # -- 5. write --
     with open(Path(path), "w", encoding="utf-8") as f:
         _write_header(f)
         _write_points(f, points)
@@ -841,7 +842,7 @@ def save_fbd(scene, path) -> dict:
 def _write_header(f) -> None:
     f.write("# *****************************************************\n")
     f.write("# *\n")
-    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.27)\n")
+    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.28)\n")
     f.write("# *\n")
     f.write("# *****************************************************/\n\n")
     f.write("# Parameters :\n")
