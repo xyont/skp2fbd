@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
-"""CalculiX CGX .fbd exporter - v0.0.23.
+"""CalculiX CGX .fbd exporter - v0.0.27.
 
-v0.0.23: _process_curve_edges fit circle PER-CID (bukan sekali dari
-semua titik). Fix center bergeser untuk setengah ring yang diproses
-sebagai face normal.
+v0.0.27: Fix radial ring penuh â€” 4 radial (bukan 5). Radial share
+antar sektor.
 """
 from __future__ import annotations
 
@@ -19,11 +18,11 @@ from tools.base import Tool
 
 
 _USE_LDV_ON_ARC = True
-_VERSION = "0.0.23"
+_VERSION = "0.0.27"
 
 
 class ExportFBDTool(Tool):
-    name = "Export CalculiX FBD v0.0.23"
+    name = "Export CalculiX FBD v0.0.27"
     shortcut = None
     uses_snap = False
 
@@ -57,15 +56,12 @@ class ExportFBDTool(Tool):
         except Exception:
             size_str = "?"
 
-        # Baca header .fbd (baris # Write ...)
         header_lines = []
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.rstrip("\n")
-                    if line.startswith("# Write"):
-                        header_lines.append(line)
-                    elif line.startswith("# Parameters"):
+                    if line.startswith("# Write") or line.startswith("# Parameters"):
                         header_lines.append(line)
         except Exception:
             pass
@@ -262,6 +258,34 @@ def _angle_ccw(p, center):
     return a
 
 
+def _build_curve_adj(mesh):
+    adj = defaultdict(list)
+    for e in mesh.edges:
+        if getattr(e, 'curve', None) is None:
+            continue
+        adj[id(e.v0)].append(e)
+        adj[id(e.v1)].append(e)
+    return adj
+
+
+def _build_radial_adj(mesh):
+    adj = defaultdict(list)
+    for e in mesh.edges:
+        if getattr(e, 'curve', None) is not None:
+            continue
+        if getattr(e, 'hidden', False):
+            continue
+        adj[id(e.v0)].append(e)
+        adj[id(e.v1)].append(e)
+    return adj
+
+
+def _is_intermediate_v26(v, curve_adj, radial_adj):
+    n_curve = len(curve_adj.get(id(v), []))
+    n_radial = len(radial_adj.get(id(v), []))
+    return n_curve == 2 and n_radial == 0
+
+
 def _vertex_edge_count(v):
     try:
         e = v.edges
@@ -312,32 +336,39 @@ def _order_curve_vertices(edges, verts):
     return ordered
 
 
-def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
-                         curve_reg, circles, add_point, edge_to_line,
-                         cid_offset=0):
-    """Proses grup edge busur jadi busur-busur CGX.
-    v0.0.23: fit circle PER-CID (setiap cid punya center sendiri).
-    """
+def _process_face_curves(face, mesh, point_reg, line_reg, lines,
+                         curve_reg, circles, add_point, edge_to_line):
+    loop = list(face.loop)
+    n = len(loop)
+    if n < 3:
+        return
+
+    curve_edges = []
+    for i in range(n):
+        va = loop[i]
+        vb = loop[(i + 1) % n]
+        e = mesh.find_edge(va, vb)
+        if e is not None and getattr(e, 'curve', None) is not None:
+            curve_edges.append(e)
+
     if not curve_edges:
         return
 
-    # Group by cid
     by_cid = defaultdict(list)
     for e in curve_edges:
         cid = getattr(e, "curve", None)
         by_cid[cid].append(e)
 
     for cid, edges in by_cid.items():
-        # Fit circle per-cid
-        all_pts = []
-        seen = set()
+        cid_pts = []
+        seen_cid = set()
         for e in edges:
             for v in (e.v0, e.v1):
-                if id(v) not in seen:
-                    seen.add(id(v))
-                    all_pts.append(v.position)
+                if id(v) not in seen_cid:
+                    seen_cid.add(id(v))
+                    cid_pts.append(v.position)
 
-        if len(all_pts) < 3:
+        if len(cid_pts) < 3:
             for e in edges:
                 pa = add_point(e.v0.position)
                 pb = add_point(e.v1.position)
@@ -346,7 +377,7 @@ def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
                 edge_to_line[id(e)] = lid
             continue
 
-        fit = _fit_circle_geometric(all_pts)
+        fit = _fit_circle_geometric(cid_pts)
         if fit is None:
             for e in edges:
                 pa = add_point(e.v0.position)
@@ -367,8 +398,6 @@ def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
         if center_idx is None:
             circles.append((cid_pt, round(radius * 1000.0, 6)))
             center_idx = len(circles)
-
-        angle_of = _make_angle_fn(center, normal)
 
         vset = {}
         for e in edges:
@@ -396,10 +425,11 @@ def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
         else:
             is_closed = False
 
-        n_edges = len(edges)
-        n_arcs = max(1, int(round(n_edges / 6.0)))
-        if is_closed and n_arcs < 4:
+        if is_closed:
             n_arcs = 4
+        else:
+            n_edges = len(edges)
+            n_arcs = max(1, int(round(n_edges / 6.0)))
 
         n_v = len(verts)
         boundaries = []
@@ -419,7 +449,7 @@ def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
             pa = add_point(v_a.position)
             pb = add_point(v_b.position)
             lid = line_reg.ensure(
-                ("arc", (cid, k)),
+                ("arc", (id(face), cid, k)),
                 _make_factory_line(pa, pb, center_idx))
             for i in range(i_start, min(i_end, n_v - 1)):
                 if i + 1 >= n_v:
@@ -434,7 +464,9 @@ def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
 
 def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
                   circles, add_point, edge_to_line):
-    """Proses ring penuh via hole_loops: 2 sektor."""
+    """Proses ring penuh via hole_loops: 4 sektor.
+    v0.0.27: 4 radial (bukan 5), share antar sektor.
+    """
     outer = list(face.loop)
     holes = list(getattr(face, 'hole_loops', []) or [])
     if not holes:
@@ -536,22 +568,25 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             best_idx = i
     verts_i = verts_i[best_idx:] + verts_i[:best_idx]
 
-    n_arcs = 2
+    # 4 sektor
+    n_arcs = 4
 
     n_v_o = len(verts_o)
     n_v_i = len(verts_i)
 
     outer_starts = []
     inner_starts = []
-    for k in range(n_arcs + 1):
+    for k in range(n_arcs):
         idx_o = int(round(k * (n_v_o - 1) / n_arcs)) % n_v_o
         idx_i = int(round(k * (n_v_i - 1) / n_arcs)) % n_v_i
         outer_starts.append(verts_o[idx_o])
         inner_starts.append(verts_i[idx_i])
 
+    # Busur outer (4 busur)
     for k in range(n_arcs):
+        k_next = (k + 1) % n_arcs
         v_a = outer_starts[k]
-        v_b = outer_starts[k + 1]
+        v_b = outer_starts[k_next]
         pa = add_point(v_a.position)
         pb = add_point(v_b.position)
         lid = line_reg.ensure(
@@ -570,9 +605,11 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             if e is not None and getattr(e, 'curve', None) is not None:
                 edge_to_line[id(e)] = lid
 
+    # Busur inner (4 busur)
     for k in range(n_arcs):
+        k_next = (k + 1) % n_arcs
         v_a = inner_starts[k]
-        v_b = inner_starts[k + 1]
+        v_b = inner_starts[k_next]
         pa = add_point(v_a.position)
         pb = add_point(v_b.position)
         lid = line_reg.ensure(
@@ -591,20 +628,23 @@ def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
             if e is not None and getattr(e, 'curve', None) is not None:
                 edge_to_line[id(e)] = lid
 
-    for k in range(n_arcs + 1):
-        v_a = outer_starts[k % (n_arcs + 1)]
-        v_b = inner_starts[k % (n_arcs + 1)]
+    # v0.0.27: 4 radial (bukan 5)
+    for k in range(n_arcs):
+        v_a = outer_starts[k]
+        v_b = inner_starts[k]
         pa = add_point(v_a.position)
         pb = add_point(v_b.position)
         line_reg.ensure(
-            ("radial", (id(face), k % (n_arcs + 1))),
+            ("radial", (id(face), k)),
             _make_factory_line(pa, pb, None))
 
+    # 4 sektor quad (share radial)
     sectors = []
     for k in range(n_arcs):
+        k_next = (k + 1) % n_arcs
         sec_keys = [
             ("arc_outer", (id(face), k)),
-            ("radial", (id(face), (k + 1) % (n_arcs + 1))),
+            ("radial", (id(face), k_next)),
             ("arc_inner", (id(face), k)),
             ("radial", (id(face), k)),
         ]
@@ -636,26 +676,7 @@ def save_fbd(scene, path) -> dict:
             points.append((_mm(p.x()), _mm(p.y()), _mm(p.z())))
         return pid
 
-    # -- 1. curves --
-    for mesh, _owner in meshes:
-        curve_edges = [e for e in mesh.edges
-                       if getattr(e, "curve", None) is not None]
-        if not curve_edges:
-            continue
-
-        has_ring = False
-        for face in mesh.faces:
-            holes = getattr(face, 'hole_loops', []) or []
-            if holes:
-                has_ring = True
-                break
-
-        if not has_ring:
-            _process_curve_edges(
-                curve_edges, mesh, point_reg, line_reg, lines,
-                curve_reg, circles, add_point, edge_to_line)
-
-    # -- 2. straight edges --
+    # -- 1. straight edges (global) --
     for mesh, _owner in meshes:
         for e in mesh.edges:
             if getattr(e, "curve", None) is not None:
@@ -668,8 +689,10 @@ def save_fbd(scene, path) -> dict:
                 ("line", id(e)), _make_factory_line(pa, pb, None))
             edge_to_line[id(e)] = lid
 
-    # -- 3. surfaces --
+    # -- 2. surfaces --
     for mesh, owner in meshes:
+        curve_adj = _build_curve_adj(mesh)
+        radial_adj = _build_radial_adj(mesh)
         for face in mesh.faces:
             loop = list(face.loop)
             n = len(loop)
@@ -693,7 +716,13 @@ def save_fbd(scene, path) -> dict:
                                 {"owner": owner, "gsurs": [sec_lids]})
                 continue
 
-            all_inter = all(_is_intermediate_vertex(v) for v in loop)
+            _process_face_curves(
+                face, mesh, point_reg, line_reg, lines,
+                curve_reg, circles, add_point, edge_to_line)
+
+            all_inter = all(
+                _is_intermediate_v26(v, curve_adj, radial_adj)
+                for v in loop)
             has_curve = False
             for i in range(n):
                 va = loop[i]
@@ -710,8 +739,8 @@ def save_fbd(scene, path) -> dict:
                 v_a = loop[i]
                 v_b = loop[(i + 1) % n]
                 if skip_intermediate:
-                    if (_is_intermediate_vertex(v_a)
-                            and _is_intermediate_vertex(v_b)):
+                    if (_is_intermediate_v26(v_a, curve_adj, radial_adj)
+                            and _is_intermediate_v26(v_b, curve_adj, radial_adj)):
                         continue
                 e = mesh.find_edge(v_a, v_b)
                 if e is None:
@@ -736,7 +765,7 @@ def save_fbd(scene, path) -> dict:
             if deduped:
                 all_surfaces.append({"owner": owner, "gsurs": [deduped]})
 
-    # -- 4. volumes --
+    # -- 3. volumes --
     owner_surfaces = defaultdict(list)
     for i, surf in enumerate(all_surfaces, start=1):
         if surf.get("owner") is not None:
@@ -751,7 +780,7 @@ def save_fbd(scene, path) -> dict:
         gid = group_reg.id_of(g.uid)
         volumes.append({"id": gid, "surfaces": surf_ids})
 
-    # -- 5. Remove dangling points --
+    # -- 4. Remove dangling points --
     used = set()
     for entry in lines:
         used.add(entry[0])
@@ -790,7 +819,7 @@ def save_fbd(scene, path) -> dict:
     circles = new_circles
     points = new_points
 
-    # -- 6. write --
+    # -- 5. write --
     with open(Path(path), "w", encoding="utf-8") as f:
         _write_header(f)
         _write_points(f, points)
@@ -812,7 +841,7 @@ def save_fbd(scene, path) -> dict:
 def _write_header(f) -> None:
     f.write("# *****************************************************\n")
     f.write("# *\n")
-    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.23)\n")
+    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.27)\n")
     f.write("# *\n")
     f.write("# *****************************************************/\n\n")
     f.write("# Parameters :\n")
