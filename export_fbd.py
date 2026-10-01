@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
-"""CalculiX CGX .fbd exporter - v0.0.10.
+"""CalculiX CGX .fbd exporter - v0.0.23.
 
-v0.0.10: Sama seperti v0.0.7 (per-cid, struktur benar), tapi
-fit circle pakai 3 titik tersebar (exact) untuk center yang presisi.
+v0.0.23: _process_curve_edges fit circle PER-CID (bukan sekali dari
+semua titik). Fix center bergeser untuk setengah ring yang diproses
+sebagai face normal.
 """
 from __future__ import annotations
 
@@ -18,10 +19,11 @@ from tools.base import Tool
 
 
 _USE_LDV_ON_ARC = True
+_VERSION = "0.0.23"
 
 
 class ExportFBDTool(Tool):
-    name = "Export CalculiX FBD v0.0.10"
+    name = "Export CalculiX FBD v0.0.23"
     shortcut = None
     uses_snap = False
 
@@ -41,15 +43,44 @@ class ExportFBDTool(Tool):
         if not path.lower().endswith(".fbd"):
             path += ".fbd"
         try:
-            save_fbd(scene, path)
+            stats = save_fbd(scene, path)
         except Exception as exc:
             QMessageBox.critical(viewport.window(),
                                  "Export CalculiX FBD",
                                  f"Export failed:\n\n{exc}")
             return
+
+        p = Path(path)
+        try:
+            size_kb = p.stat().st_size / 1024.0
+            size_str = f"{size_kb:.2f} KB"
+        except Exception:
+            size_str = "?"
+
+        # Baca header .fbd (baris # Write ...)
+        header_lines = []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if line.startswith("# Write"):
+                        header_lines.append(line)
+                    elif line.startswith("# Parameters"):
+                        header_lines.append(line)
+        except Exception:
+            pass
+
+        msg = (
+            f"File   : {p.name}\n"
+            f"Folder : {p.parent}\n"
+            f"Size   : {size_str}\n"
+            f"Versi  : v{_VERSION}\n"
+            f"\n"
+            + "\n".join(header_lines)
+        )
         QMessageBox.information(viewport.window(),
                                 "Export CalculiX FBD",
-                                f"Wrote {Path(path).name}")
+                                msg)
 
     def on_deactivate(self, viewport) -> None:
         pass
@@ -128,14 +159,12 @@ def _sub3(a, b):
 
 
 def _fit_circle_3pts(p1, p2, p3):
-    """Fit circle exact dari 3 titik di bidang 3D."""
     v1 = _sub3(p2, p1)
     v2 = _sub3(p3, p1)
     normal = QVector3D.crossProduct(v1, v2)
     if normal.length() < 1e-9:
         return None
     normal = normal.normalized()
-
     u = v1.normalized()
     v = QVector3D.crossProduct(normal, u)
 
@@ -147,7 +176,6 @@ def _fit_circle_3pts(p1, p2, p3):
     ax, ay = to_2d(p1)
     bx, by = to_2d(p2)
     cx, cy = to_2d(p3)
-
     d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
     if abs(d) < 1e-15:
         return None
@@ -161,51 +189,54 @@ def _fit_circle_3pts(p1, p2, p3):
     if r2 < 1e-12:
         return None
     radius = math.sqrt(r2)
-
     center = p1 + u * ux + v * uy
     return center, normal, radius
 
 
 def _fit_circle_geometric(points):
-    """Fit circle dari 3 titik tersebar (exact) â€” lebih stabil
-    daripada least-squares untuk busur parsial."""
     n = len(points)
     if n < 3:
         return None
     if n == 3:
         return _fit_circle_3pts(points[0], points[1], points[2])
 
-    # Pilih 3 titik tersebar
-    p1 = points[0]
-    p2 = points[n // 2]
-    line_dir = _sub3(p2, p1)
-    line_len = line_dir.length()
-    if line_len < 1e-9:
-        # p1 dan p2 terlalu dekat, coba titik lain
-        for i in range(1, n):
-            p2 = points[i]
-            line_dir = _sub3(p2, p1)
-            line_len = line_dir.length()
-            if line_len > 1e-9:
-                break
+    xs = [p.x() for p in points]
+    ys = [p.y() for p in points]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+
+    def ang_idx(i):
+        p = points[i]
+        return math.atan2(p.y() - cy, p.x() - cx)
+
+    sorted_idx = sorted(range(n), key=ang_idx)
+    i1 = sorted_idx[0]
+    i2 = sorted_idx[n // 3]
+    i3 = sorted_idx[2 * n // 3]
+
+    if i1 == i2 or i2 == i3 or i1 == i3:
+        p1 = points[0]
+        p2 = points[n // 2]
+        line_dir = _sub3(p2, p1)
+        line_len = line_dir.length()
         if line_len < 1e-9:
             return None
+        line_dir_n = line_dir / line_len
+        best_dist = -1.0
+        p3 = None
+        for p in points:
+            d = _sub3(p, p1)
+            proj = QVector3D.dotProduct(d, line_dir_n)
+            perp = d - line_dir_n * proj
+            dist = perp.length()
+            if dist > best_dist:
+                best_dist = dist
+                p3 = p
+        if p3 is None or best_dist < 1e-9:
+            return None
+        return _fit_circle_3pts(p1, p2, p3)
 
-    line_dir_n = line_dir / line_len
-    best_dist = -1.0
-    p3 = None
-    for p in points:
-        d = _sub3(p, p1)
-        proj = QVector3D.dotProduct(d, line_dir_n)
-        perp = d - line_dir_n * proj
-        dist = perp.length()
-        if dist > best_dist:
-            best_dist = dist
-            p3 = p
-    if p3 is None or best_dist < 1e-9:
-        return None
-
-    return _fit_circle_3pts(p1, p2, p3)
+    return _fit_circle_3pts(points[i1], points[i2], points[i3])
 
 
 def _make_angle_fn(center, normal):
@@ -220,6 +251,15 @@ def _make_angle_fn(center, normal):
         return math.atan2(QVector3D.dotProduct(d, v),
                           QVector3D.dotProduct(d, u))
     return angle_of
+
+
+def _angle_ccw(p, center):
+    d_x = p.x() - center.x()
+    d_y = p.y() - center.y()
+    a = math.atan2(d_y, d_x)
+    if a < 0:
+        a += 2 * math.pi
+    return a
 
 
 def _vertex_edge_count(v):
@@ -249,7 +289,6 @@ def _order_curve_vertices(edges, verts):
         adj[id(e.v1)].append((e.v0, e))
 
     endpoints = [v for v in verts if len(adj[id(v)]) == 1]
-
     if len(endpoints) >= 2:
         start_v = endpoints[0]
     else:
@@ -270,11 +309,310 @@ def _order_curve_vertices(edges, verts):
         ordered.append(next_v)
         visited.add(id(next_v))
         current = next_v
-
     return ordered
 
 
-def save_fbd(scene, path) -> None:
+def _process_curve_edges(curve_edges, mesh, point_reg, line_reg, lines,
+                         curve_reg, circles, add_point, edge_to_line,
+                         cid_offset=0):
+    """Proses grup edge busur jadi busur-busur CGX.
+    v0.0.23: fit circle PER-CID (setiap cid punya center sendiri).
+    """
+    if not curve_edges:
+        return
+
+    # Group by cid
+    by_cid = defaultdict(list)
+    for e in curve_edges:
+        cid = getattr(e, "curve", None)
+        by_cid[cid].append(e)
+
+    for cid, edges in by_cid.items():
+        # Fit circle per-cid
+        all_pts = []
+        seen = set()
+        for e in edges:
+            for v in (e.v0, e.v1):
+                if id(v) not in seen:
+                    seen.add(id(v))
+                    all_pts.append(v.position)
+
+        if len(all_pts) < 3:
+            for e in edges:
+                pa = add_point(e.v0.position)
+                pb = add_point(e.v1.position)
+                lid = line_reg.ensure(
+                    ("line", id(e)), _make_factory_line(pa, pb, None))
+                edge_to_line[id(e)] = lid
+            continue
+
+        fit = _fit_circle_geometric(all_pts)
+        if fit is None:
+            for e in edges:
+                pa = add_point(e.v0.position)
+                pb = add_point(e.v1.position)
+                lid = line_reg.ensure(
+                    ("line", id(e)), _make_factory_line(pa, pb, None))
+                edge_to_line[id(e)] = lid
+            continue
+
+        center, normal, radius = fit
+        cid_pt = add_point(center)
+
+        center_idx = None
+        for i, (c, _r) in enumerate(circles, start=1):
+            if c == cid_pt:
+                center_idx = i
+                break
+        if center_idx is None:
+            circles.append((cid_pt, round(radius * 1000.0, 6)))
+            center_idx = len(circles)
+
+        angle_of = _make_angle_fn(center, normal)
+
+        vset = {}
+        for e in edges:
+            vset[id(e.v0)] = e.v0
+            vset[id(e.v1)] = e.v1
+        verts_all = list(vset.values())
+        if len(verts_all) < 2:
+            continue
+
+        verts = _order_curve_vertices(edges, verts_all)
+        if len(verts) < 2:
+            continue
+
+        adj_local = defaultdict(list)
+        for e in edges:
+            adj_local[id(e.v0)].append(e)
+            adj_local[id(e.v1)].append(e)
+
+        endpoint_count = sum(1 for v in verts
+                             if len(adj_local[id(v)]) == 1)
+        if endpoint_count >= 2:
+            is_closed = False
+        elif endpoint_count == 0:
+            is_closed = True
+        else:
+            is_closed = False
+
+        n_edges = len(edges)
+        n_arcs = max(1, int(round(n_edges / 6.0)))
+        if is_closed and n_arcs < 4:
+            n_arcs = 4
+
+        n_v = len(verts)
+        boundaries = []
+        for k in range(n_arcs + 1):
+            idx = int(round(k * n_v / n_arcs)) % n_v
+            boundaries.append(idx)
+        if not is_closed:
+            boundaries[-1] = n_v - 1
+
+        for k in range(n_arcs):
+            i_start = boundaries[k]
+            i_end = boundaries[k + 1]
+            if i_start >= n_v or i_end > n_v:
+                continue
+            v_a = verts[i_start]
+            v_b = verts[i_end] if i_end < n_v else verts[-1]
+            pa = add_point(v_a.position)
+            pb = add_point(v_b.position)
+            lid = line_reg.ensure(
+                ("arc", (cid, k)),
+                _make_factory_line(pa, pb, center_idx))
+            for i in range(i_start, min(i_end, n_v - 1)):
+                if i + 1 >= n_v:
+                    break
+                v1 = verts[i]
+                v2 = verts[i + 1]
+                e = mesh.find_edge(v1, v2)
+                if (e is not None
+                        and getattr(e, "curve", None) is not None):
+                    edge_to_line[id(e)] = lid
+
+
+def _process_ring(face, mesh, point_reg, line_reg, lines, curve_reg,
+                  circles, add_point, edge_to_line):
+    """Proses ring penuh via hole_loops: 2 sektor."""
+    outer = list(face.loop)
+    holes = list(getattr(face, 'hole_loops', []) or [])
+    if not holes:
+        return None
+    hole = list(holes[0])
+
+    outer_edges = []
+    for i in range(len(outer)):
+        va = outer[i]
+        vb = outer[(i + 1) % len(outer)]
+        e = mesh.find_edge(va, vb)
+        if e is not None and getattr(e, 'curve', None) is not None:
+            outer_edges.append(e)
+
+    hole_edges = []
+    for i in range(len(hole)):
+        va = hole[i]
+        vb = hole[(i + 1) % len(hole)]
+        e = mesh.find_edge(va, vb)
+        if e is not None and getattr(e, 'curve', None) is not None:
+            hole_edges.append(e)
+
+    if not outer_edges or not hole_edges:
+        return None
+
+    outer_pts = []
+    seen_o = set()
+    for e in outer_edges:
+        for v in (e.v0, e.v1):
+            if id(v) not in seen_o:
+                seen_o.add(id(v))
+                outer_pts.append(v.position)
+    fit_o = _fit_circle_geometric(outer_pts)
+    if fit_o is None:
+        return None
+    center_o, normal_o, radius_o = fit_o
+    cid_pt_o = add_point(center_o)
+
+    hole_pts = []
+    seen_i = set()
+    for e in hole_edges:
+        for v in (e.v0, e.v1):
+            if id(v) not in seen_i:
+                seen_i.add(id(v))
+                hole_pts.append(v.position)
+    fit_i = _fit_circle_geometric(hole_pts)
+    if fit_i is None:
+        return None
+    center_i, normal_i, radius_i = fit_i
+    cid_pt_i = add_point(center_i)
+
+    center_idx_o = None
+    for i, (cid, _r) in enumerate(circles, start=1):
+        if cid == cid_pt_o:
+            center_idx_o = i
+            break
+    if center_idx_o is None:
+        circles.append((cid_pt_o, round(radius_o * 1000.0, 6)))
+        center_idx_o = len(circles)
+
+    center_idx_i = None
+    for i, (cid, _r) in enumerate(circles, start=1):
+        if cid == cid_pt_i:
+            center_idx_i = i
+            break
+    if center_idx_i is None:
+        circles.append((cid_pt_i, round(radius_i * 1000.0, 6)))
+        center_idx_i = len(circles)
+
+    verts_o = _order_curve_vertices(outer_edges, outer)
+    verts_i = _order_curve_vertices(hole_edges, hole)
+
+    if len(verts_o) < 2 or len(verts_i) < 2:
+        return None
+
+    a_o0 = _angle_ccw(verts_o[0].position, center_o)
+    a_o1 = _angle_ccw(verts_o[1].position, center_o)
+    diff_o = (a_o1 - a_o0) % (2 * math.pi)
+    dir_o = 1 if diff_o < math.pi else -1
+
+    a_i0 = _angle_ccw(verts_i[0].position, center_i)
+    a_i1 = _angle_ccw(verts_i[1].position, center_i)
+    diff_i = (a_i1 - a_i0) % (2 * math.pi)
+    dir_i = 1 if diff_i < math.pi else -1
+
+    if dir_o != dir_i:
+        verts_i = list(reversed(verts_i))
+
+    a_o0 = _angle_ccw(verts_o[0].position, center_o)
+    best_idx = 0
+    best_diff = 1e9
+    for i, v in enumerate(verts_i):
+        a_i = _angle_ccw(v.position, center_i)
+        diff = abs(a_i - a_o0)
+        if diff > math.pi:
+            diff = 2 * math.pi - diff
+        if diff < best_diff:
+            best_diff = diff
+            best_idx = i
+    verts_i = verts_i[best_idx:] + verts_i[:best_idx]
+
+    n_arcs = 2
+
+    n_v_o = len(verts_o)
+    n_v_i = len(verts_i)
+
+    outer_starts = []
+    inner_starts = []
+    for k in range(n_arcs + 1):
+        idx_o = int(round(k * (n_v_o - 1) / n_arcs)) % n_v_o
+        idx_i = int(round(k * (n_v_i - 1) / n_arcs)) % n_v_i
+        outer_starts.append(verts_o[idx_o])
+        inner_starts.append(verts_i[idx_i])
+
+    for k in range(n_arcs):
+        v_a = outer_starts[k]
+        v_b = outer_starts[k + 1]
+        pa = add_point(v_a.position)
+        pb = add_point(v_b.position)
+        lid = line_reg.ensure(
+            ("arc_outer", (id(face), k)),
+            _make_factory_line(pa, pb, center_idx_o))
+        idx_a = int(round(k * (n_v_o - 1) / n_arcs)) % n_v_o
+        idx_b = int(round((k + 1) * (n_v_o - 1) / n_arcs)) % n_v_o
+        if idx_b <= idx_a:
+            idx_b += n_v_o
+        for i in range(idx_a, idx_b):
+            ii = i % n_v_o
+            i2 = (i + 1) % n_v_o
+            v1 = verts_o[ii]
+            v2 = verts_o[i2]
+            e = mesh.find_edge(v1, v2)
+            if e is not None and getattr(e, 'curve', None) is not None:
+                edge_to_line[id(e)] = lid
+
+    for k in range(n_arcs):
+        v_a = inner_starts[k]
+        v_b = inner_starts[k + 1]
+        pa = add_point(v_a.position)
+        pb = add_point(v_b.position)
+        lid = line_reg.ensure(
+            ("arc_inner", (id(face), k)),
+            _make_factory_line(pa, pb, center_idx_i))
+        idx_a = int(round(k * (n_v_i - 1) / n_arcs)) % n_v_i
+        idx_b = int(round((k + 1) * (n_v_i - 1) / n_arcs)) % n_v_i
+        if idx_b <= idx_a:
+            idx_b += n_v_i
+        for i in range(idx_a, idx_b):
+            ii = i % n_v_i
+            i2 = (i + 1) % n_v_i
+            v1 = verts_i[ii]
+            v2 = verts_i[i2]
+            e = mesh.find_edge(v1, v2)
+            if e is not None and getattr(e, 'curve', None) is not None:
+                edge_to_line[id(e)] = lid
+
+    for k in range(n_arcs + 1):
+        v_a = outer_starts[k % (n_arcs + 1)]
+        v_b = inner_starts[k % (n_arcs + 1)]
+        pa = add_point(v_a.position)
+        pb = add_point(v_b.position)
+        line_reg.ensure(
+            ("radial", (id(face), k % (n_arcs + 1))),
+            _make_factory_line(pa, pb, None))
+
+    sectors = []
+    for k in range(n_arcs):
+        sec_keys = [
+            ("arc_outer", (id(face), k)),
+            ("radial", (id(face), (k + 1) % (n_arcs + 1))),
+            ("arc_inner", (id(face), k)),
+            ("radial", (id(face), k)),
+        ]
+        sectors.append(sec_keys)
+    return sectors
+
+
+def save_fbd(scene, path) -> dict:
     meshes = list(_iter_meshes_with_owner(scene))
     point_reg = _Registry()
     line_reg = _Registry()
@@ -298,112 +636,24 @@ def save_fbd(scene, path) -> None:
             points.append((_mm(p.x()), _mm(p.y()), _mm(p.z())))
         return pid
 
-    # -- 1. curves (per-cid seperti v0.0.7) --
+    # -- 1. curves --
     for mesh, _owner in meshes:
         curve_edges = [e for e in mesh.edges
                        if getattr(e, "curve", None) is not None]
         if not curve_edges:
             continue
 
-        # Fit circle global (untuk center) â€” pakai 3 titik
-        all_pts_global = []
-        seen_global = set()
-        for e in curve_edges:
-            for v in (e.v0, e.v1):
-                if id(v) not in seen_global:
-                    seen_global.add(id(v))
-                    all_pts_global.append(v.position)
+        has_ring = False
+        for face in mesh.faces:
+            holes = getattr(face, 'hole_loops', []) or []
+            if holes:
+                has_ring = True
+                break
 
-        if len(all_pts_global) < 3:
-            continue
-
-        fit_global = _fit_circle_geometric(all_pts_global)
-        if fit_global is None:
-            for e in curve_edges:
-                pa = add_point(e.v0.position)
-                pb = add_point(e.v1.position)
-                lid = line_reg.ensure(
-                    ("line", id(e)), _make_factory_line(pa, pb, None))
-                edge_to_line[id(e)] = lid
-            continue
-
-        center, normal, radius = fit_global
-        cid_pt = add_point(center)
-        curve_id = curve_reg.id_of(("center", id(mesh)))
-        if curve_id > len(circles):
-            circles.append((cid_pt, round(radius * 1000.0, 6)))
-
-        angle_of = _make_angle_fn(center, normal)
-
-        # Proses per-cid (seperti v0.0.7)
-        by_cid = defaultdict(list)
-        for e in curve_edges:
-            cid = getattr(e, "curve", None)
-            by_cid[cid].append(e)
-
-        for cid, edges in by_cid.items():
-            vset = {}
-            for e in edges:
-                vset[id(e.v0)] = e.v0
-                vset[id(e.v1)] = e.v1
-            verts_all = list(vset.values())
-            if len(verts_all) < 2:
-                continue
-
-            verts = _order_curve_vertices(edges, verts_all)
-            if len(verts) < 2:
-                continue
-
-            adj_local = defaultdict(list)
-            for e in edges:
-                adj_local[id(e.v0)].append(e)
-                adj_local[id(e.v1)].append(e)
-
-            endpoint_count = sum(1 for v in verts
-                                 if len(adj_local[id(v)]) == 1)
-
-            if endpoint_count >= 2:
-                is_closed = False
-            elif endpoint_count == 0:
-                is_closed = True
-            else:
-                is_closed = False
-
-            n_edges = len(edges)
-            n_arcs = max(1, int(round(n_edges / 3.0)))
-            if is_closed and n_arcs < 4:
-                n_arcs = 4
-
-            n_v = len(verts)
-            boundaries = []
-            for k in range(n_arcs + 1):
-                idx = int(round(k * n_v / n_arcs)) % n_v
-                boundaries.append(idx)
-            if not is_closed:
-                boundaries[-1] = n_v - 1
-
-            for k in range(n_arcs):
-                i_start = boundaries[k]
-                i_end = boundaries[k + 1]
-                if i_start >= n_v or i_end > n_v:
-                    continue
-                v_a = verts[i_start]
-                v_b = verts[i_end] if i_end < n_v else verts[-1]
-                pa = add_point(v_a.position)
-                pb = add_point(v_b.position)
-                # Kunci busur per cid (seperti v0.0.7)
-                lid = line_reg.ensure(
-                    ("arc", (cid, k)),
-                    _make_factory_line(pa, pb, cid_pt))
-                for i in range(i_start, min(i_end, n_v - 1)):
-                    if i + 1 >= n_v:
-                        break
-                    v1 = verts[i]
-                    v2 = verts[i + 1]
-                    e = mesh.find_edge(v1, v2)
-                    if (e is not None
-                            and getattr(e, "curve", None) is not None):
-                        edge_to_line[id(e)] = lid
+        if not has_ring:
+            _process_curve_edges(
+                curve_edges, mesh, point_reg, line_reg, lines,
+                curve_reg, circles, add_point, edge_to_line)
 
     # -- 2. straight edges --
     for mesh, _owner in meshes:
@@ -421,19 +671,35 @@ def save_fbd(scene, path) -> None:
     # -- 3. surfaces --
     for mesh, owner in meshes:
         for face in mesh.faces:
-            loop_vertices = list(face.loop)
-            if len(loop_vertices) < 3:
+            loop = list(face.loop)
+            n = len(loop)
+            if n < 3:
                 continue
-            n = len(loop_vertices)
 
-            all_inter = all(_is_intermediate_vertex(v)
-                            for v in loop_vertices)
+            holes = getattr(face, 'hole_loops', []) or []
+            if holes:
+                ring_sectors = _process_ring(
+                    face, mesh, point_reg, line_reg, lines,
+                    curve_reg, circles, add_point, edge_to_line)
+                if ring_sectors:
+                    for sec in ring_sectors:
+                        sec_lids = []
+                        for key in sec:
+                            lid = line_reg.peek(key)
+                            if lid is not None:
+                                sec_lids.append(lid)
+                        if len(sec_lids) == 4:
+                            all_surfaces.append(
+                                {"owner": owner, "gsurs": [sec_lids]})
+                continue
+
+            all_inter = all(_is_intermediate_vertex(v) for v in loop)
             has_curve = False
             for i in range(n):
-                v_a = loop_vertices[i]
-                v_b = loop_vertices[(i + 1) % n]
-                e = mesh.find_edge(v_a, v_b)
-                if e is not None and getattr(e, "curve", None) is not None:
+                va = loop[i]
+                vb = loop[(i + 1) % n]
+                e = mesh.find_edge(va, vb)
+                if e is not None and getattr(e, 'curve', None) is not None:
                     has_curve = True
                     break
 
@@ -441,8 +707,8 @@ def save_fbd(scene, path) -> None:
 
             face_lines = []
             for i in range(n):
-                v_a = loop_vertices[i]
-                v_b = loop_vertices[(i + 1) % n]
+                v_a = loop[i]
+                v_b = loop[(i + 1) % n]
                 if skip_intermediate:
                     if (_is_intermediate_vertex(v_a)
                             and _is_intermediate_vertex(v_b)):
@@ -534,11 +800,19 @@ def save_fbd(scene, path) -> None:
         _write_volumes(f, volumes, len(all_surfaces))
         _write_text(f)
 
+    return {
+        "n_points": len(points),
+        "n_lines": len(lines),
+        "n_surfaces": len(all_surfaces),
+        "n_circles": len(circles),
+        "n_volumes": len(volumes),
+    }
+
 
 def _write_header(f) -> None:
     f.write("# *****************************************************\n")
     f.write("# *\n")
-    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.10)\n")
+    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.23)\n")
     f.write("# *\n")
     f.write("# *****************************************************/\n\n")
     f.write("# Parameters :\n")
