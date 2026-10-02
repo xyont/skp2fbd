@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
-"""CalculiX CGX .fbd exporter - v0.0.28.
+"""CalculiX CGX .fbd exporter - v0.0.31b.
 
-v0.0.28: Fix wrap di _process_face_curves â€” busur terakhir tidak
-diproses karena boundaries[-1]=0 (wrap). Sekarang handle i_end <= i_start.
+v0.0.31b:
+* Solid group: curve TIDAK dikonversi â€” biarkan garis lurus apa adanya.
+* 2D (owner=None): tetap busur (per-face).
+* Kubus: OK. Silinder: OK (garis lurus).
 """
 from __future__ import annotations
 
@@ -18,11 +20,11 @@ from tools.base import Tool
 
 
 _USE_LDV_ON_ARC = True
-_VERSION = "0.0.28"
+_VERSION = "0.0.31b"
 
 
 class ExportFBDTool(Tool):
-    name = "Export CalculiX FBD v0.0.28"
+    name = "Export CalculiX FBD v0.0.31b"
     shortcut = None
     uses_snap = False
 
@@ -43,7 +45,7 @@ class ExportFBDTool(Tool):
             path += ".fbd"
         try:
             stats = save_fbd(scene, path)
-        except Exception as exc:
+        except Exception as exc:                       # noqa: BLE001
             QMessageBox.critical(viewport.window(),
                                  "Export CalculiX FBD",
                                  f"Export failed:\n\n{exc}")
@@ -336,11 +338,13 @@ def _order_curve_vertices(edges, verts):
     return ordered
 
 
+# v0.0.31b: _trace_chains dan _process_all_curves TIDAK dipakai
+# (kita biarkan curve edge sebagai garis lurus untuk solid group)
+
+
 def _process_face_curves(face, mesh, point_reg, line_reg, lines,
                          curve_reg, circles, add_point, edge_to_line):
-    """Proses busur untuk 1 face.
-    v0.0.28: fix wrap â€” handle i_end <= i_start.
-    """
+    """Proses busur untuk 1 face (dipakai untuk model 2D)."""
     loop = list(face.loop)
     n = len(loop)
     if n < 3:
@@ -442,28 +446,20 @@ def _process_face_curves(face, mesh, point_reg, line_reg, lines,
         if not is_closed:
             boundaries[-1] = n_v - 1
 
-        # v0.0.28: fix wrap
         for k in range(n_arcs):
             i_start = boundaries[k]
             i_end = boundaries[k + 1]
             if i_start >= n_v:
                 continue
-            # Handle wrap: kalau i_end <= i_start, berarti sampai akhir
             if i_end <= i_start:
                 i_end = n_v
-            # Titik ujung busur
             v_a = verts[i_start]
-            if i_end == n_v:
-                # Busur terakhir: v_b = verts[0] (kembali ke awal)
-                v_b = verts[0]
-            else:
-                v_b = verts[i_end]
+            v_b = verts[i_end] if i_end < n_v else verts[0]
             pa = add_point(v_a.position)
             pb = add_point(v_b.position)
             lid = line_reg.ensure(
                 ("arc", (id(face), cid, k)),
                 _make_factory_line(pa, pb, center_idx))
-            # Petakan edge dalam range [i_start, i_end)
             for i in range(i_start, i_end):
                 if i >= n_v:
                     break
@@ -682,6 +678,7 @@ def save_fbd(scene, path) -> dict:
             points.append((_mm(p.x()), _mm(p.y()), _mm(p.z())))
         return pid
 
+    # -- 1. straight edges (global) --
     for mesh, _owner in meshes:
         for e in mesh.edges:
             if getattr(e, "curve", None) is not None:
@@ -694,7 +691,34 @@ def save_fbd(scene, path) -> dict:
                 ("line", id(e)), _make_factory_line(pa, pb, None))
             edge_to_line[id(e)] = lid
 
+    # -- 2. curves untuk SOLID GROUP: TIDAK diproses (biarkan garis lurus) --
+    # v0.0.31b: khusus solid group (owner != None), curve edge ditulis
+    # sebagai garis lurus (ldv), bukan busur.
     for mesh, owner in meshes:
+        if owner is None:
+            continue
+        # Tulis curve edge solid group sebagai garis lurus
+        for e in mesh.edges:
+            if getattr(e, "curve", None) is None:
+                continue
+            if getattr(e, "hidden", False):
+                continue
+            pa = add_point(e.v0.position)
+            pb = add_point(e.v1.position)
+            # key pakai id(e) + "line" â€” bukan "arc"
+            lid = line_reg.ensure(
+                ("line", id(e)), _make_factory_line(pa, pb, None))
+            edge_to_line[id(e)] = lid
+
+    # -- 3. surfaces --
+    for mesh, owner in meshes:
+        # 2D: per-face (proses curve jadi busur)
+        if owner is None:
+            for face in mesh.faces:
+                _process_face_curves(
+                    face, mesh, point_reg, line_reg, lines,
+                    curve_reg, circles, add_point, edge_to_line)
+
         curve_adj = _build_curve_adj(mesh)
         radial_adj = _build_radial_adj(mesh)
         for face in mesh.faces:
@@ -719,10 +743,6 @@ def save_fbd(scene, path) -> dict:
                             all_surfaces.append(
                                 {"owner": owner, "gsurs": [sec_lids]})
                 continue
-
-            _process_face_curves(
-                face, mesh, point_reg, line_reg, lines,
-                curve_reg, circles, add_point, edge_to_line)
 
             all_inter = all(
                 _is_intermediate_v26(v, curve_adj, radial_adj)
@@ -753,8 +773,12 @@ def save_fbd(scene, path) -> dict:
                 if lid is None:
                     pa = add_point(v_a.position)
                     pb = add_point(v_b.position)
-                    is_curve = getattr(e, "curve", None) is not None
-                    key = ("arc" if is_curve else "line", id(e))
+                    # v0.0.31b: untuk solid group, curve jadi garis lurus
+                    if owner is not None:
+                        key = ("line", id(e))
+                    else:
+                        is_curve = getattr(e, "curve", None) is not None
+                        key = ("arc" if is_curve else "line", id(e))
                     lid = line_reg.ensure(
                         key, _make_factory_line(pa, pb, None))
                     edge_to_line[id(e)] = lid
@@ -769,6 +793,7 @@ def save_fbd(scene, path) -> dict:
             if deduped:
                 all_surfaces.append({"owner": owner, "gsurs": [deduped]})
 
+    # -- 4. volumes --
     owner_surfaces = defaultdict(list)
     for i, surf in enumerate(all_surfaces, start=1):
         if surf.get("owner") is not None:
@@ -783,6 +808,7 @@ def save_fbd(scene, path) -> dict:
         gid = group_reg.id_of(g.uid)
         volumes.append({"id": gid, "surfaces": surf_ids})
 
+    # -- 5. Remove dangling points --
     used = set()
     for entry in lines:
         used.add(entry[0])
@@ -821,6 +847,7 @@ def save_fbd(scene, path) -> dict:
     circles = new_circles
     points = new_points
 
+    # -- 6. write --
     with open(Path(path), "w", encoding="utf-8") as f:
         _write_header(f)
         _write_points(f, points)
@@ -842,7 +869,7 @@ def save_fbd(scene, path) -> dict:
 def _write_header(f) -> None:
     f.write("# *****************************************************\n")
     f.write("# *\n")
-    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.28)\n")
+    f.write("# *  CalculiX CGX fbd-file exported by IngeTrazo (v0.0.31b)\n")
     f.write("# *\n")
     f.write("# *****************************************************/\n\n")
     f.write("# Parameters :\n")
