@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Suyono Nt. and DeepSeek contributors.
+# Copyright (C) 2026 Suyono Nt.
 """CalculiX CGX .fbd exporter - v0.0.31b.
 
 v0.0.31b:
