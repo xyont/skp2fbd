@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """IGES writer untuk IngeTrazo.
-
-Port Python dari IxMilia.Iges:
-  - IgesFileWriter.cs   (format baris, section, wrapping)
-  - IgesFile.cs         (Global Section, default values)
-  - IgesEntity.cs       (AddDirectoryAndParameterLines, status number)
-  - IgesPoint.cs        (struct 3D)
-  - IgesVector.cs       (struct 3D)
-  - IgesLine.cs         (entity 110)
-  - IgesCircularArc.cs  (entity 100)
-  - IgesPointEntity.cs  (entity 116) — wrapper untuk IgesPoint
-
 Entity didukung: Point (116), Line (110), Circular Arc (100).
 Unit default: millimeter (flag 2). Versi IGES default: 5.3 (11).
 """
